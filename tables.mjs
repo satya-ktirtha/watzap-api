@@ -21,6 +21,8 @@ class Table {
         this.key = key;
         this.columns = columns;
         this.joints = [];
+        this.leftJoints = [];
+        this.alias = name;
     }
 
     getName() {
@@ -39,6 +41,20 @@ class Table {
         return this.joints;
     }
 
+    getLeftJoints() {
+        return this.leftJoints;
+    }
+
+    getAlias() {
+        return `\`${this.alias}\``;
+    }
+
+    setAlias(name) {
+        this.alias = name;
+
+        return this;
+    }
+
     /**
      * This Method cross joins two tables together. 
      * The method joins the two tables by comparing the given key and
@@ -51,6 +67,13 @@ class Table {
      */
     join(other, key) {
         this.joints.push({'other': other, 'key': `\`${key}\``});
+
+        return this;
+    }
+
+    leftJoin(other, key) {
+        this.leftJoints.push({'other': other, 'key': `\`${key}\``});
+
         return this;
     }
 }
@@ -85,9 +108,40 @@ class User extends Table {
     }
 }
 
+// TODO multiple primary keys
 class Manifest extends Table {
     constructor(columns) {
         super('tManifest', 'cManifest', columns);
+    }
+}
+
+class POD2 extends Table {
+    constructor(columns) {
+        super('mCity2', 'cCity2', columns);
+    }
+}
+
+class Supplier extends Table {
+    constructor(columns) {
+        super('mSupplier', 'cSuppCode', columns);
+    }
+}
+
+class Purc3 extends Table {
+    constructor(columns) {
+        super('tPurc3', 'cInvoice', columns);
+    }
+}
+
+class Purc4 extends Table {
+    constructor(columns) {
+        super('tPurc4', 'cSTT', columns);
+    }
+}
+
+class AWB extends Table {
+    constructor(columns) {
+        super('tAWB', 'cAWB', columns);
     }
 }
 
@@ -98,5 +152,10 @@ export {
     Shipper,
     Session,
     User,
-    Manifest
+    Manifest,
+    POD2,
+    Supplier,
+    Purc3,
+    Purc4,
+    AWB
 }

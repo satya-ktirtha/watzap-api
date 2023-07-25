@@ -4,6 +4,10 @@ import dotenv from 'dotenv';
 import session, { deleteSession } from './session.mjs';
 import handle from './handler.mjs';
 import { sendMessage } from './watzap.mjs';
+import path from 'path';
+import url from 'url';
+
+const __dirname = url.fileURLToPath(new URL('.', import.meta.url));
 
 dotenv.config();
 const app = express();
@@ -24,6 +28,7 @@ async function execute(path, args) {
 }
 
 app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 
 app.post('/hook', session, async function(req, res) {
     const session = req.session;
@@ -36,6 +41,8 @@ app.post('/hook', session, async function(req, res) {
     } catch(e) {
         console.log(e);
         if(e.code === 'ECONNABORTED') {
+            res.send({'status': -1});
+        } else if(e.code === 'ETIMEDOUT') {
             res.send({'status': -1});
         } else {
             await execute('/send_message', {

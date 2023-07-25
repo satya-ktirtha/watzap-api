@@ -2,10 +2,13 @@ import axios from 'axios';
 import geo from 'node-geo-distance';
 import { getSTT } from './stt.mjs';
 import { renewSession, deleteSession } from './session.mjs';
-import { STT, Consignee, Shipper, Manifest, User } from './tables.mjs';
+import { STT, Consignee, Shipper, Manifest, User, POD2, Supplier, AWB } from './tables.mjs';
 import QueryBuilder from './query.mjs';
 import { executeBuilder } from './db.mjs';
-import { sendMessage } from './watzap.mjs';
+import { sendMessage, sendFile, notifyNumber } from './watzap.mjs';
+import PDFDocumentWithTable from './pdf.mjs';
+import fs from 'fs';
+import path from 'path';
 
 const ANTAR = 1;
 const LINTAS = 2;
@@ -90,9 +93,9 @@ class DateTimeHandler extends BaseHandler {
     }
 
     check(session, data) {
-        const value = data.message_body + ":00";
+        const value = data.message_body;
         const timestamp = new Date(value).getTime();
-        if(isNaN(timestamp)) {
+        if(isNaN(timestamp) || new Date(value).toString() === "Invalid Date") {
             this.setNotification("Format tanggal dan waktu salah");
             return false;
         }
@@ -102,26 +105,72 @@ class DateTimeHandler extends BaseHandler {
 }
 
 class StringHandler extends BaseHandler {
-    constructor(field, name) {
+    constructor(field, name, check=undefined) {
         super(field);
 
-        this.prompt = `Ketik ${name.toLowerCase()}`;
+        this.name = name;
+        this.customCheck = check || ((session, data, context) => data.message_body);
+        this.prompt = `Ketik ${name}`;
         this.setNotification(this.prompt);
     }
 
-    check(session, data) {
+    async check(session, data) {
         if(data.message_body.length === 0) {
             this.setNotification(`${this.name} tidak boleh kosong`);
             return false;
         }
 
-        return data.message_body;
+        return await this.customCheck(session, data, this);
     }
 
     async update(session, data, value) {
         await super.update(session, data, value);
     }
 }
+
+class NumberHandler extends BaseHandler {
+    constructor(field, name) {
+        super(field);
+
+        this.name = name;
+        this.prompt = `Ketik ${name.toLowerCase()}`;
+        this.setNotification(this.prompt);
+    }
+
+    check(session, data) {
+        const value = parseInt(data.message_body);
+        if(isNaN(value)) {
+            this.setNotification(`${this.name} salah`);
+            return false;
+        }
+
+        return value;
+    }
+}
+
+class DecimalHandler extends BaseHandler {
+    constructor(field, name, prompt) {
+        super(field);
+
+        this.name = name;
+        if(!prompt) {
+            this.prompt = `Ketik ${name.toLowerCase()}`;
+        } else {
+            this.prompt = prompt;
+        }
+
+        this.setNotification(this.prompt);
+    }
+
+    check(session, data) {
+        const value = parseFloat(data.message_body);
+        if(isNaN(value)) {
+            this.setNotification(`${this.name} salah`);
+            return;
+        }
+    }
+}
+
 
 class ListInputHandler extends BaseHandler {
     constructor(field, name, separator) {
@@ -130,7 +179,7 @@ class ListInputHandler extends BaseHandler {
         this.name = name;
         this.separator = separator;
         const msg = separator === "\n" ? "garis baru" : separator;
-        this.setNotification(`Masukan list STT (dipisah dengan ${msg})`)
+        this.setNotification(`Masukan ${name} (dipisah dengan ${msg})`)
     }
 
     check(session, data) {
@@ -148,7 +197,7 @@ class ListInputHandler extends BaseHandler {
 }
 
 class ChoiceHandler extends BaseHandler {
-    constructor(name, choices, prompt) {
+    constructor(name, choices) {
         super(name);
 
         this.choices = choices;
@@ -183,17 +232,21 @@ class DriverHandler extends StringHandler {
     }
 
     async check(session, data) {
-        const number = super.check(session, data);
+        const number = await super.check(session, data);
 
+        console.log('checking driver exist');
         const user = new User();
         const findUser = QueryBuilder.start()
                                       .select().from(user).whereEqual(user, 'cNumber', number);
 
+        console.log(findUser.build().query, findUser.build().conditions);
         const [users, fields] = await executeBuilder(findUser);
         if(users.length !== 1) {
+            console.log('driver does not exist');
             this.setNotification('Supir tidak ada');
             return false;
         }
+            console.log('driver  exist');
 
         return number;
     }
@@ -225,7 +278,7 @@ class ManifestHandler extends StringHandler {
     }
 
     async check(session, data) {
-        const manifest = super.check(session, data);
+        const manifest = await super.check(session, data);
         if(!manifest) {
             return false;
         }
@@ -237,21 +290,25 @@ class ManifestHandler extends StringHandler {
          * 3: jemput
          * Example for manifest number 00200 antar from jkt to jkt on 2023 July: 2307JKTJKT002001
          */
-        if(manifest.length !== 'yymmpolpodiiiiit'.length) {
+        if(manifest.length !== 'polpodtyymmddii'.length) {
+            console.log("length error");
             this.setNotification('Format nomor manifest salah');
             return false;
         } 
-        const dateManifest = manifest.substring(0, 4);
-        const locManifest = manifest.substring(4, 10);
-        const indexManifest = parseInt(manifest.substring(10, 15));
-        const typeManifest = parseInt(manifest.substring(15));
+
+        const locManifest = manifest.substring(0, 6);
+        const typeManifest = parseInt(manifest.substring(6, 7));
+        const dateManifest = manifest.substring(7, 13);
+        const indexManifest = parseInt(manifest.substring(13));
 
         if(isNaN(dateManifest) || isNaN(indexManifest) || isNaN(typeManifest)) {
+            console.log("nan error");
             this.setNotification('Format nomor manifest salah');
             return false;
         }
 
         if(typeManifest < 1 || typeManifest > 3) {
+            console.log("type error");
             this.setNotification('Format nomor manifest salah');
             return false;
         }
@@ -262,20 +319,53 @@ class ManifestHandler extends StringHandler {
                 'cSupir': 'driver',
                 'cKeterangan': 'keterangan',
                 'dETA': 'eta',
-                'cType': 'type'
+                'cType': 'type',
+                'dCreated': 'createDate',
+                'cAWB': 'awb',
+                'cPIC': 'pic'
             });
 
             const sttTable = new STT({
                 'cShipName': 'shipper',
                 'cCneeName': 'consignee',
                 'nQty': 'quantity',
-                'nChWeight': 'weight',
+                'cPOL': 'pol',
+                'cPOD': 'pod',
+                'cCmdtDesc': 'description',
+                'nGrWeight': 'actualWeight',
+                'nChWeight': 'chargeWeight',
+                'nVlWeight': 'volumeWeight',
+                'nPanjang': 'panjang',
+                'nLebar': 'lebar',
+                'nTinggi': 'tinggi',
                 'cStatusShpt': 'statusJemput',
                 'cStatusCnee': 'statusAntar'
             });
 
-            manifestTable.join(sttTable, 'cSTT');
+            const userTable = new User({
+                'cName': 'userName'
+            }).setAlias('creator');
 
+            const supirTable = new User({
+                'cName': 'supirName'
+            }).setAlias('supir')
+
+            const pod2Table = new POD2({
+                'cCityName': 'pod2'
+            });
+
+            const supplier = new Supplier({
+                'cSuppName': 'supplier'
+            });
+
+            const awb = new AWB();
+
+            sttTable.join(pod2Table, 'cPODdesc');
+
+            manifestTable.join(sttTable, 'cSTT')
+                         .join(userTable, 'cCreatedBy')
+                         .join(supirTable, 'cSupir')
+                         .leftJoin(awb.leftJoin(supplier, 'cAgenCode'), 'cAWB');
 
             const builder = QueryBuilder.start().select().from(manifestTable)
                                                 .whereEqual(manifestTable, 'cTgl', dateManifest)
@@ -293,6 +383,7 @@ class ManifestHandler extends StringHandler {
                 res = await getManifest();
             }
 
+            console.log(res);
             if(res.length === 0) {
                 this.setNotification("Manifest tidak ada");
                 return false;
@@ -326,10 +417,14 @@ class ManifestHandler extends StringHandler {
                 res = await getManifest();
             }
 
-            session.data.driver = res[0].driver;
-            session.data.keterangan = res[0].keterangan;
-            session.data.date = res[0].eta;
-            await renewSession(session, data.timestamp);
+            if(res.length > 0) {
+                session.data.driver = res[0].driver;
+                session.data.keterangan = res[0].keterangan;
+                session.data.date = res[0].eta;
+                session.data.awb = res[0].awb;
+                session.data.pic = res[0].pic;
+                await renewSession(session, data.timestamp);
+            }
         }
 
         return manifest;
@@ -354,6 +449,12 @@ class MenuHandler extends BaseHandler {
     }
 
     async handle(session, data) {
+        if(data.message_body.toUpperCase() === 'EXIT') {
+            sendMessage(session, "Ketik MENU untuk mulai lagi");
+            await deleteSession(session.number);
+            return;
+        }
+
         try {
             if(session.data[this.field] === undefined) {
                 await this.notify(session);
@@ -836,6 +937,11 @@ function getSendHandler() {
                 .whereEqual(stt, 'cSTT', dataSTT.stt);
 
             await executeBuilder(builder);
+            if(session.number === '6281293893669' || session.number === '6289656139959') {
+                await notifyNumber(session, '6282114512888', `Notification utk shipper (nomor ${dataSTT.shipperNumber}).\nSupir ${session.user.name} telah antar paket dengan stt ${dataSTT.stt}.`)
+                await notifyNumber(session, '6282114512888', `Notification utk consignee (nomor ${dataSTT.consigneeNumber}).\nSupir ${session.user.name} telah antar paket dengan stt ${dataSTT.stt}.`)
+            }
+
         })
         .build();
 }
@@ -848,13 +954,17 @@ function getFetchHandler() {
         'cCity': 'shipperCity',
     });
 
+    const consignee = new Consignee({
+        'cMobile': 'consigneeNumber'
+    });
+
     const stt = new STT({
         'cSTT': 'stt',
         'cCmdtDesc': 'commodityDesc',
         'cShipName': 'shipperName',
         'nChWeight': 'weight',
         'nQty': 'quantity',
-    }).join(shipper, 'cShipCode');
+    }).join(shipper, 'cShipCode').join(consignee, 'cCneeCode');
 
     const formatString = (sessionData) => {
         /*
@@ -909,6 +1019,11 @@ function getFetchHandler() {
                 .whereEqual(stt, 'cSTT', dataSTT.stt);
 
             await executeBuilder(builder);
+
+            if(session.number === '6281293893669' || session.number === '6289656139959') {
+                await notifyNumber(session, '6282114512888', `Notification utk shipper (nomor ${dataSTT.shipperNumber}).\nSupir ${session.user.name} telah jemput paket dengan stt ${dataSTT.stt}.`)
+                await notifyNumber(session, '6282114512888', `Notification utk consignee (nomor ${dataSTT.consigneeNumber}).\nSupir ${session.user.name} telah jemput paket dengan stt ${dataSTT.stt}.`)
+            }
         })
         .build();
 }
@@ -922,14 +1037,16 @@ function getCreateManifestHandler() {
         .add(new ListInputHandler("stt_list", "list stt", "\n"))
         .add(new DateTimeHandler("Ketik ETA (tanggal dan waktu):"))
         .add(new StringHandler("keterangan", "keterangan"))
+        .add(new StringHandler("awb", "awb"))
+        .add(new StringHandler("pic", "pic"))
         .add(new DriverHandler())
         .endWith(async (session, data) => {
             sendMessage(session, "Mohon tunggu");
             const manifest = session.data.manifest_number.toUpperCase();
-            const dateManifest = manifest.substring(0, 4);
-            const locManifest = manifest.substring(4, 10);
-            const indexManifest = manifest.substring(10, 15);
-            const typeManifest = manifest.substring(15);
+            const locManifest = manifest.substring(0, 6);
+            const typeManifest = parseInt(manifest.substring(6, 7));
+            const dateManifest = manifest.substring(7, 13);
+            const indexManifest = parseInt(manifest.substring(13));
             const polManifest = locManifest.substring(0, 3);
             const podManifest = locManifest.substring(3);
             const sttData = session.data.stt_list.split('\n');
@@ -937,11 +1054,14 @@ function getCreateManifestHandler() {
             const keterangan = session.data.keterangan;
             // date is in mmddyyyy
             const ETA = session.data.date;
+            const awb = session.data.awb;
+            const pic = session.data.pic;
 
             let errMsg = "";
             const duplicates = [];
             const notFound = [];
             const wrongPorts = [];
+            const success = [];
 
             /*
              * TODO
@@ -959,6 +1079,13 @@ function getCreateManifestHandler() {
                     'nQty': 'quantity',
                     'nChWeight': 'weight'
                 });
+                const consigneeTable = new Consignee({
+                    'cMobile': 'consigneeNumber'
+                });
+                const shipperTable = new Shipper({
+                    'cMobile': 'shipperNumber'
+                });
+                sttTable.join(consigneeTable, 'cCneeCode').join(shipperTable, 'cShipCode');
                 const findStt = QueryBuilder.start()
                                             .select().from(sttTable)
                                             .whereEqual(sttTable, 'cSTT', sttNumber);
@@ -975,9 +1102,21 @@ function getCreateManifestHandler() {
                     continue;
                 }
 
-                if(stt.pol !== polManifest || stt.pod !== podManifest) {
-                    wrongPorts.push(stt);
-                    continue;
+                if(typeManifest === LINTAS) {
+                    if(stt.pol !== polManifest || stt.pod !== podManifest) {
+                        wrongPorts.push(stt);
+                        continue;
+                    }
+                } else if(typeManifest === ANTAR) {
+                    if(stt.pod !== podManifest) {
+                        wrongPorts.push(stt);
+                        continue;
+                    }
+                } else if(typeManifest === JEMPUT) {
+                    if(stt.pol !== polManifest) {
+                        wrongPorts.push(stt);
+                        continue
+                    }
                 }
 
                 try {
@@ -989,11 +1128,19 @@ function getCreateManifestHandler() {
                         'cSTT': stt.stt,
                         'cSupir': driver,
                         'dETA': new Date(ETA),
-                        'cKeterangan': keterangan
+                        'cKeterangan': keterangan,
+                        'cCreatedBy': session.number,
+                        'cAWB': awb,
+                        'cPIC': pic
                     });
 
                     const createManifest = QueryBuilder.start().insert().into(insertManifest);
                     const res = await executeBuilder(createManifest);
+                    success.push(stt);
+
+                    const shipperNumber = stt.shipperNumber;
+                    const consigneeNumber = stt.consigneeNumber;
+
                 } catch(e) {
                     if(e.code === 'ER_DUP_ENTRY') {
                         duplicates.push(stt.stt);
@@ -1001,6 +1148,16 @@ function getCreateManifestHandler() {
                         throw e;
                     }
                 }
+            }
+
+            // TODO NOTIFY_MANIFEST 
+            if(session.number === '6281293893669') {
+                let notification = '';
+                for(const stt of success) {
+                    // TODO SEND NOTIF FOR EVERY STT SHIPPER, CONSIGNEE
+                    notification += `${stt.stt}\n`;
+                }
+                await notifyNumber(session, '6282114512888', `Notification manifest creation. ${session.user.name} membuat manifest ${manifest} dengan stt:\n${notification}`)
             }
 
             if(duplicates.length > 0) {
@@ -1021,6 +1178,7 @@ function getCreateManifestHandler() {
             if(errMsg !== "") {
                 await sendMessage(session, errMsg);
             }
+
         })
         .endImmediately()
         .build();
@@ -1038,10 +1196,10 @@ function getUpdateManifestHandler() {
         .add(new DriverHandler())
         .endWith(async (session, data) => {
             const manifest = session.data.manifest_number.toUpperCase();
-            const dateManifest = manifest.substring(0, 4);
-            const locManifest = manifest.substring(4, 10);
-            const indexManifest = parseInt(manifest.substring(10, 15));
-            const typeManifest = parseInt(manifest.substring(15));
+            const locManifest = manifest.substring(0, 6);
+            const typeManifest = parseInt(manifest.substring(6, 7));
+            const dateManifest = manifest.substring(7, 13);
+            const indexManifest = parseInt(manifest.substring(13));
             const driver = session.data.driver;
             const keterangan = session.data.keterangan;
             const eta = session.data.date;
@@ -1063,9 +1221,86 @@ function getUpdateManifestHandler() {
         .build();
 }
 
+function getAdminSTTHandler() {
+    const updateField = async (session, data, field) => {
+        const stt = new STT({
+            field: session.data.value
+        })
+
+        const updateSTT = QueryBuilder.start().update().set(stt);
+
+        await executeBuilder(updateSTT);
+    };
+
+    const STTUpdateMenu = {
+        "Volume": HandlerBuilder.begin()
+                            .add(new StringHandler('stt', 'nomor STT', async (session, data, context) => {
+                                const stt = data.message_body;
+
+                                const sttTable = new STT();
+                                const findSTT = QueryBuilder.start()
+                                                            .select()
+                                                            .from(sttTable)
+                                                            .whereEqual(sttTable, 'cSTT', stt);
+                                const [ sttList, fields ] = await executeBuilder(findSTT);
+                                if(sttList.length < 1) {
+                                    context.setNotification('STT tidak ada');
+                                    return false;
+                                }
+
+                                return sttList[0];
+                            }))
+                            .add(new StringHandler("dimensions", "dimensi (PxLxT)", (session, data, context) => {
+                                const volumeList = data.message_body.split('x');
+                                const panjang = volumeList[0];
+                                const lebar = volumeList[1];
+                                const tinggi = volumeList[2];
+
+                                if(!panjang || !lebar || !tinggi) {
+                                    context.setNotification('Format salah (PxLxT)');
+                                    return false;
+                                }
+
+                                return {panjang, lebar, tinggi};
+                            }))
+                            .endWith(async (session, data) => {
+                                const stt = session.data.stt;
+                                const actualWeight = stt.nGrWeight;
+                                const dimensions = session.data.dimensions;
+                                const volume = dimensions.panjang * dimensions.lebar * dimensions.tinggi;
+                                const vlWeight = volume / 4000;
+                                const chWeight = Math.max(actualWeight, vlWeight);
+
+                                const sttTable = new STT({
+                                    'nPanjang': dimensions.panjang,
+                                    'nLebar': dimensions.lebar,
+                                    'nTinggi': dimensions.tinggi,
+                                    'nVlWeight': vlWeight,
+                                    'nChWeight': chWeight
+                                })
+
+                                const updateQuery = QueryBuilder.start()
+                                                                .update()
+                                                                .set(sttTable)
+                                                                .whereEqual(sttTable, 'cSTT', stt.cSTT);
+
+                                await executeBuilder(updateQuery);
+
+                                const msg = `Gross Weight: ${actualWeight}\nVolume Weight: ${vlWeight}\nCharged Weight: ${chWeight}\n`;
+                                await sendMessage(session, msg);
+                            })
+                            .build()
+
+    }
+    
+    return HandlerBuilder.begin()
+        .add(new MenuHandler("stt_menu", STTUpdateMenu))
+        .build();
+}
+
 function getAdminHandler() {
     const adminMenu = {
-        "Update STT": getSendHandler(),
+        "Update STT": getAdminSTTHandler(),
         "Create/Add into Manifest": getCreateManifestHandler(),
         "Update Manifest": getUpdateManifestHandler()
     };
@@ -1075,7 +1310,7 @@ function getAdminHandler() {
         .build();
 }
 
-function getManifestListhandler() {
+function getManifestListHandler() {
     return HandlerBuilder.begin()
         .add(new ManifestHandler({
             'exists': true,
@@ -1085,11 +1320,31 @@ function getManifestListhandler() {
         .endWith(async (session, data) => {
             await sendMessage(session, "Mohon tunggu");
             const manifest = session.data.manifest_number;
-            const dateManifest = manifest.substring(0, 4);
-            const locManifest = manifest.substring(4, 10);
-            const indexManifest = parseInt(manifest.substring(10, 15));
-            const typeManifest = parseInt(manifest.substring(15));
+            const locManifest = manifest.substring(0, 6);
+            const typeManifest = parseInt(manifest.substring(6, 7));
+            const dateManifest = manifest.substring(7, 13);
+            const indexManifest = parseInt(manifest.substring(13));
             const sttList = session.data.manifestSTT;
+
+            const sttTable = {
+                complex: {
+                    headers: [
+                        { header: 'STT' },
+                        { header: 'PENGIRIM' },
+                        { header: 'POL' },
+                        { header: 'POD' },
+                        { header: 'KOMODITI' },
+                        { header: 'PENERIMA' },
+                        { header: 'QTY' },
+                        { header: 'AWT' },
+                        { header: 'VWT' },
+                        { header: 'CWT' },
+                        { header: 'AGENT' },
+                        { header: 'PIC' }
+                    ],
+                    rows: []
+                }
+            }
 
             let res = "";
             let totalWeight = 0;
@@ -1100,10 +1355,7 @@ function getManifestListhandler() {
                  * Kalau manifest jemput, check cStatusShpt
                  */
 
-                console.log(sttObj);
-                console.log(sttObj.type, parseInt(sttObj.type), ANTAR);
                 if(parseInt(sttObj.type) === ANTAR) {
-                    console.log('check status antar', sttObj.statusAntar);
                     if(sttObj.statusAntar !== null) {
                         continue;
                     }
@@ -1113,25 +1365,107 @@ function getManifestListhandler() {
                     }
                 }
 
-                totalWeight += parseInt(sttObj.weight);
+                totalWeight += parseInt(sttObj.actualWeight);
                 totalQuantity += parseInt(sttObj.quantity);
 
-                res += `\n${sttObj.stt}\n`;
-                res += `Shipper: ${sttObj.shipper}\n`;
-                res += `Consignee: ${sttObj.consignee}\n`;
-                res += `Quantity: ${sttObj.quantity}\n`;
-                res += `Weight: ${sttObj.weight} kg\n`;
-                res += `Keterangan:\n${sttObj.keterangan}\n`;
+                sttTable.complex.rows.push({
+                    data: {
+                        stt: `${sttObj.stt}`,
+                        pengirim: `${sttObj.shipper || "-"}`,
+                        pol: `${sttObj.pol || "-"}`,
+                        pod: `${sttObj.pod2 || "-"}`,
+                        komoditi: `${sttObj.description.replaceAll('\n', '') || "-"}`,
+                        penerima: `${sttObj.consignee || "-"}`,
+                        qty: `${sttObj.quantity.substring(0, sttObj.quantity.indexOf('.')) || "-"}`,
+                        awt: `${sttObj.actualWeight?.substring(0, sttObj.actualWeight.indexOf('.')) || "-"}`,
+                        vwt: `${sttObj.volumeWeight?.substring(0, sttObj.volumeWeight.indexOf('.')) || "-"}`,
+                        cwt: `${sttObj.chargeWeight?.substring(0, sttObj.chargeWeight.indexOf('.')) || "-"}`,
+                        agent: `${sttObj.supplier || "mjp"}`,
+                        pic: `-`
+                    }
+                })
             }
-            res += `\nTotal weight: ${totalWeight} kg\n`;
-            res += `Total quantity: ${totalQuantity}\n`;
+
+            const creationDate = new Date(sttList[0].createDate);
+            const creationYear = creationDate.getFullYear();
+            const creationMonth = creationDate.getMonth();
+            const creationDay = creationDate.getDate().toString().padStart(2, '0');
 
             const date = new Date(sttList[0].eta);
             const minutes = date.getMinutes().toString().padStart(2, '0');
 
-            res += `ETA: ${date.getDate()}-${date.getMonth() + 1}-${date.getFullYear()} ${date.getHours()}:${minutes}\n`;
+            const pdf = new PDFDocumentWithTable({
+                size: 'A4',
+                layout: 'landscape',
+                margins: {
+                    top: 10,
+                    bottom: 10,
+                    left: 10,
+                    right: 10 
+                }
+            });
 
-            await sendMessage(session, res);
+            const months = ["Jan", "Feb", "Mar", "Apr", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+            const polManifest = locManifest.substring(3);
+            const manifestTable = {
+                complex: {
+                    headers: [
+                        { header: 'MANIFEST' },
+                        { header: 'CREATED' },
+                        { header: 'ETA' },
+                        { header: 'TOTAL_QUANTITY' },
+                        { header: 'TOTAL_WEIGHT' },
+                        { header: 'DRIVER_1' },
+                        { header: 'DRIVER_2' }
+                    ],
+                    rows: [
+                        {
+                            data: {
+                                manifest: `${manifest}`,
+                                created: `${sttList[0].userName} / ${creationDay} ${months[creationMonth - 1]} ${creationYear}`,
+                                eta: `${date.getDate().toString().padStart(2, '0')} ${months[date.getMonth() - 1]} ${date.getFullYear()} ${date.getHours()}:${minutes}`,
+                                total_quantity: `${totalQuantity}`,
+                                total_weight: `${totalWeight} kg`,
+                                driver_1: `${sttList[0].supirName}`,
+                                driver_2: `-`
+                            }
+                        }
+                    ]
+                }
+            }
+
+            const driverTable = {
+                complex: {
+                    headers: [
+                        { header: 'DRIVER_1' }
+                    ], 
+                    rows: [
+                        {
+                            data: {
+                                driver_1: `${sttList[0].supirName}` 
+                            }
+                        }
+                    ]
+                }
+            }
+
+            pdf.pipe(fs.createWriteStream(path.join('public', `${manifest}.pdf`)));
+
+            pdf.table(manifestTable, { reversed: true });
+            pdf.image(path.join('public', 'mjp_logo.png'), 300, 50, { scale: 0.8} );
+            pdf.table(sttTable, {});
+
+            pdf.end();
+
+            await sendFile(session, `${manifest}.pdf`);
+
+            // TODO ERROR HANDLING HERE WHEN FILE FAILS TO BE DELETED
+            fs.unlink(path.join('public', `${manifest}.pdf`), (err) => {
+                if(err) {
+                    console.log(err);
+                }
+            });
         })
         .endImmediately()
         .build();
@@ -1179,7 +1513,7 @@ async function handle(session, data) {
     } else if(session.type === 2) {
         await getFetchHandler().handle(session, data);
     } else if(session.type === 3) {
-        await getManifestListhandler().handle(session, data);
+        await getManifestListHandler().handle(session, data);
     } else if(session.type === 100) {
         await getAdminHandler().handle(session, data);
     }

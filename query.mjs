@@ -22,52 +22,60 @@ class SelectState extends QueryState {
         let columns = "";
         let where = "";
         let from = "";
+        let on = "";
+        let crosses = "";
 
         const compileTable = (table) => {
-            if(from === "") {
-                from += `${table.getName()}`
-            } else {
-                from += ` CROSS JOIN ${table.getName()}`;
-            }
-
+            let currentName = `${table.getName()} AS ${table.getAlias()}`;
 
             const keys = Object.keys(table.getColumns());
             if(columns !== "") {
                 columns += ",";
             }
-            let temp = `${table.getName()}.*`;
+            let temp = `${table.getAlias()}.*`;
             for(const column of keys) {
-                if(temp === `${table.getName()}.*`) {
-                    temp = `${table.getName()}.\`${column}\` AS \`${table.getColumns()[column]}\``;
+                if(temp === `${table.getAlias()}.*`) {
+                    temp = `${table.getAlias()}.\`${column}\` AS \`${table.getColumns()[column]}\``;
                 } else {
-                    temp += `,${table.getName()}.\`${column}\` AS \`${table.getColumns()[column]}\``;
+                    temp += `,${table.getAlias()}.\`${column}\` AS \`${table.getColumns()[column]}\``;
                 }
             }
 
             columns += temp;
 
-            for(const joint of table.getJoints()) {
-                const other = joint.other;
-                const condition = `${table.getName()}.${joint.key}=${other.getName()}.${other.getKey()}`
-                if(where !== "") {
-                    where += " AND "
+            if(table.getLeftJoints().length > 0) {
+                for(const leftJoint of table.getLeftJoints()) {
+                    currentName += ` LEFT JOIN ${compileTable(leftJoint.other)} ON ${table.getAlias()}.${leftJoint.key}=${leftJoint.other.getAlias()}.${leftJoint.other.getKey()}`;
                 }
-                where += condition;
-                compileTable(other);
             }
-        };
 
-        // TODO FIX EMPTY WHERE WHEN THERE ARE NO CONDITIONS AT ALL
+            if(table.getJoints().length > 0) {
+                for(const joint of table.getJoints()) {
+                    const other = joint.other;
+                    const otherName = compileTable(other);
+
+                    crosses += ` CROSS JOIN ${otherName}`;
+
+                    if(where !== "") {
+                        where += ' AND';
+                    }
+                    where += ` ${table.getAlias()}.${joint.key}=${other.getAlias()}.${other.getKey()}`;
+                }
+            }
+
+            return currentName;
+        }
+
         const args = [];
         for(const condition of conditions) {
             args.push(condition.value);
             if(where !== "") {
                 where += " AND ";
             }
-            where += `${condition.table.getName()}.\`${condition.field}\`${condition.operator}?`
+            where += `${condition.table.getAlias()}.\`${condition.field}\`${condition.operator}?`
         }
 
-        const res = compileTable(table, "", "" ,"");
+        from = compileTable(table) + crosses;
         let query = `SELECT ${columns} FROM ${from}`;
         if(where !== "") {
             query += ` WHERE ${where}`;
